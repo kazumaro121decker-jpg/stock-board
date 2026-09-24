@@ -1,0 +1,27 @@
+{
+  "markets": [
+    { "symbol": "^N225",     "name": "日経平均",         "type": "index" },
+    { "symbol": "NIY=F",     "name": "日経225先物(CME)",  "type": "future" },
+    { "symbol": "^DJI",      "name": "NYダウ",           "type": "index" },
+    { "symbol": "^GSPC",     "name": "S&P500",          "type": "index" },
+    { "symbol": "^IXIC",     "name": "NASDAQ総合",       "type": "index" },
+    { "symbol": "^SOX",      "name": "SOX半導体指数",     "type": "index" },
+    { "symbol": "^VIX",      "name": "VIX恐怖指数",       "type": "index" },
+    { "symbol": "JPY=X",     "name": "ドル/円",           "type": "fx" },
+    { "symbol": "EURJPY=X",  "name": "ユーロ/円",         "type": "fx" },
+    { "symbol": "EURUSD=X",  "name": "ユーロ/ドル",       "type": "fx" },
+    { "symbol": "^TNX",      "name": "米10年債利回り",     "type": "rate" },
+    { "symbol": "GC=F",      "name": "金先物",            "type": "commodity" },
+    { "symbol": "CL=F",      "name": "WTI原油",          "type": "commodity" },
+    { "symbol": "BTC-JPY",   "name": "ビットコイン",       "type": "crypto" }
+  ],
+  "symbols": [
+    { "symbol": "0331418A.T", "name": "eMAXIS Slim 全世界株式(オルカン)", "list": "hold", "type": "fund", "news": "オルカン 全世界株式" },
+    { "symbol": "AMAT",       "name": "アプライド マテリアルズ",          "list": "hold", "type": "stock", "news": "アプライドマテリアルズ" },
+    { "symbol": "AMD",        "name": "AMD",                           "list": "hold", "type": "stock", "news": "AMD 株" },
+    { "symbol": "NVDA",       "name": "エヌビディア",                    "list": "hold", "type": "stock", "news": "エヌビディア" },
+    { "symbol": "SPCX",       "name": "スペースX",                      "list": "hold", "type": "stock", "news": "スペースX 株" },
+    { "symbol": "TSLA",       "name": "テスラ",                         "list": "hold", "type": "stock", "news": "テスラ 株" },
+    { "symbol": "429A.T",     "name": "テクセンドフォトマスク",            "list": "hold", "type": "stock", "news": "テクセンドフォトマスク" }
+  ]
+}

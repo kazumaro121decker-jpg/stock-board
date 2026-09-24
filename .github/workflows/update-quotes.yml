@@ -1,0 +1,54 @@
+name: 株価データ更新
+
+on:
+  schedule:
+    # 平日: 15分ごと (UTC表記。東証・米国市場の取引時間をカバー)
+    - cron: "*/15 * * * 1-5"
+    # 土日: 3時間ごと (為替・暗号資産・ニュース用)
+    - cron: "7 */3 * * 0,6"
+  push:
+    branches: [main]
+    paths:
+      - data/watchlist.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-quotes
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+
+      - run: pip install -r scripts/requirements.txt
+
+      - name: 株価を取得
+        run: python scripts/fetch_quotes.py
+
+      - name: 変更をコミット
+        run: |
+          git config user.name "stock-board-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/quotes.json
+          if git diff --cached --quiet; then
+            echo "変更なし"
+            exit 0
+          fi
+          git commit -m "データ更新 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
+          for i in 1 2 3; do
+            git pull --rebase -X theirs origin main && git push origin HEAD:main && exit 0
+            sleep 5
+          done
+          exit 1
