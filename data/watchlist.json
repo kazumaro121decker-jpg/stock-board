@@ -16,7 +16,7 @@
     { "symbol": "BTC-JPY",   "name": "ビットコイン",       "type": "crypto" }
   ],
   "symbols": [
-    { "symbol": "0331418A.T", "name": "eMAXIS Slim 全世界株式(オルカン)", "list": "hold", "type": "fund", "news": "オルカン 全世界株式" },
+    { "symbol": "0331418A.T", "name": "eMAXIS Slim 全世界株式(オルカン)", "list": "hold", "type": "fund", "isin": "JP90C000H1T1", "news": "オルカン 全世界株式" },
     { "symbol": "AMAT",       "name": "アプライド マテリアルズ",          "list": "hold", "type": "stock", "news": "アプライドマテリアルズ" },
     { "symbol": "AMD",        "name": "AMD",                           "list": "hold", "type": "stock", "news": "AMD 株" },
     { "symbol": "NVDA",       "name": "エヌビディア",                    "list": "hold", "type": "stock", "news": "エヌビディア" },

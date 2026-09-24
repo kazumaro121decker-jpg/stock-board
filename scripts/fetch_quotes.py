@@ -41,10 +41,16 @@ SLOW_REFRESH_SEC = 12 * 3600
 NEWS_REFRESH_SEC = 3600
 NEWS_PER_SYMBOL = 6
 
-# Yahoo で取れない場合の投資信託の予備データ (三菱UFJアセットマネジメントの基準価額CSV)
-FUND_FALLBACK_CSV = {
+# Yahoo Finance に無い投資信託の予備データ
+#  1) 投資信託協会(投信総合検索ライブラリー)の基準価額CSV ... watchlist の "isin" が必要
+#  2) 運用会社のCSV (FUND_COMPANY_CSV に登録したもの)
+#  3) Yahoo!ファイナンス(日本)の銘柄ページ ... 最新の基準価額と前日比のみ
+TOUSHIN_CSV = "https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download?isinCd={isin}&associFundCd={code}"
+FUND_COMPANY_CSV = {
     "0331418A.T": "https://www.am.mufg.jp/fund_file/setteirai/253425.csv",
 }
+YAHOO_JP_FUND = "https://finance.yahoo.co.jp/quote/{code}"
+DIAG = []
 
 MARKET_NEWS_QUERIES = ["日経平均 株式市場", "米国株 ダウ ナスダック"]
 
@@ -108,46 +114,92 @@ def fetch_chart(symbol, rng, interval):
     return meta, {"t": t_out, "c": c_out, "v": v_out}
 
 
-def fetch_fund_fallback(symbol):
-    """投信会社のCSVから日次の基準価額を読む (Yahoo で取れないとき用)。"""
-    url = FUND_FALLBACK_CSV.get(symbol)
-    if not url:
+def decode_text(raw):
+    for enc in ("cp932", "utf-8-sig", "utf-8"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def parse_nav_csv(text):
+    """「年月日, 基準価額, ...」形式のCSVを日次系列にする。"""
+    t_out, c_out = [], []
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) < 2:
+            continue
+        m = re.match(r"\s*(\d{4})[/\-年](\d{1,2})[/\-月](\d{1,2})", row[0])
+        if not m:
+            continue
+        try:
+            nav = float(row[1].replace(",", "").replace("円", ""))
+        except ValueError:
+            continue
+        d = datetime(int(m[1]), int(m[2]), int(m[3]), 15, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        t_out.append(int(d.timestamp()))
+        c_out.append(rnd(nav))
+    if len(t_out) < 2:
         return None
+    pairs = sorted(zip(t_out, c_out))[-260:]
+    return {"t": [p[0] for p in pairs], "c": [p[1] for p in pairs], "v": [None] * len(pairs)}
+
+
+def fetch_csv_series(url, label):
     try:
-        r = SESSION.get(url, timeout=20)
+        r = SESSION.get(url, timeout=25)
         if r.status_code != 200:
+            DIAG.append(f"{label}: HTTP {r.status_code}")
             return None
-        raw = r.content
-        text = None
-        for enc in ("cp932", "utf-8-sig", "utf-8"):
-            try:
-                text = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        if text is None:
-            return None
-        t_out, c_out = [], []
-        for row in csv.reader(io.StringIO(text)):
-            if len(row) < 2:
-                continue
-            m = re.match(r"\s*(\d{4})[/\-年](\d{1,2})[/\-月](\d{1,2})", row[0])
-            if not m:
-                continue
-            try:
-                nav = float(row[1].replace(",", ""))
-            except ValueError:
-                continue
-            d = datetime(int(m[1]), int(m[2]), int(m[3]), 15, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
-            t_out.append(int(d.timestamp()))
-            c_out.append(rnd(nav))
-        if not t_out:
-            return None
-        pairs = sorted(zip(t_out, c_out))[-260:]
-        return {"t": [p[0] for p in pairs], "c": [p[1] for p in pairs], "v": [None] * len(pairs)}
+        text = decode_text(r.content)
+        series = parse_nav_csv(text) if text else None
+        DIAG.append(f"{label}: {'ok ' + str(len(series['t'])) + '件' if series else 'parse失敗 ' + repr((text or '')[:80])}")
+        return series
     except Exception as e:  # noqa: BLE001
-        log(f"  fund fallback error {e!r}")
+        DIAG.append(f"{label}: {e!r}"[:200])
         return None
+
+
+def fetch_yahoo_jp_fund(code):
+    """Yahoo!ファイナンス(日本)のページから最新の基準価額と前日比を読む。"""
+    try:
+        r = SESSION.get(YAHOO_JP_FUND.format(code=code), timeout=25)
+        if r.status_code != 200:
+            DIAG.append(f"yahoo.co.jp: HTTP {r.status_code}")
+            return None
+        html = r.text
+        price = re.search(r'"price":"([\d,]+(?:\.\d+)?)"', html)
+        chg = re.search(r'"changePrice":"([+\-]?[\d,]+(?:\.\d+)?)"', html)
+        if not price:
+            DIAG.append("yahoo.co.jp: 価格が見つからない")
+            return None
+        p = float(price[1].replace(",", ""))
+        c = float(chg[1].replace(",", "")) if chg else 0.0
+        DIAG.append(f"yahoo.co.jp: ok {p} ({c:+})")
+        return p, c
+    except Exception as e:  # noqa: BLE001
+        DIAG.append(f"yahoo.co.jp: {e!r}"[:200])
+        return None
+
+
+def fetch_fund_fallback(item):
+    """Yahoo Finance に無い投資信託の基準価額を取得する。戻り値: (日次系列, ソース名)"""
+    sym = item["symbol"]
+    code = sym.replace(".T", "")
+    if item.get("isin"):
+        s = fetch_csv_series(TOUSHIN_CSV.format(isin=item["isin"], code=code), "toushin-lib")
+        if s:
+            return s, "toushin-lib"
+    if sym in FUND_COMPANY_CSV:
+        s = fetch_csv_series(FUND_COMPANY_CSV[sym], "fund-company")
+        if s:
+            return s, "fund-company"
+    y = fetch_yahoo_jp_fund(code)
+    if y:
+        p, c = y
+        now = int(time.time())
+        return {"t": [now - 86400, now], "c": [rnd(p - c), rnd(p)], "v": [None, None]}, "yahoo.co.jp"
+    return None, None
 
 
 def local_date(ts, tz):
@@ -163,9 +215,8 @@ def build_quote(item, prev):
     meta, daily = fetch_chart(sym, "1y", "1d")
     source = "yahoo"
     if (not daily or not daily["t"]) and kind == "fund":
-        daily = fetch_fund_fallback(sym)
+        daily, source = fetch_fund_fallback(item)
         meta = {}
-        source = "fund-csv"
     if not daily or not daily["t"]:
         log(f"  !! {sym}: 取得できませんでした")
         if prev:
@@ -173,6 +224,13 @@ def build_quote(item, prev):
             prev["stale"] = True
             return prev
         return {"symbol": sym, "name": item.get("name") or sym, "error": "not_found", "list": item.get("list")}
+
+    if source == "yahoo.co.jp" and prev and (prev.get("daily") or {}).get("t"):
+        # 最新値だけ取れた場合は、前回までの日次データに継ぎ足す
+        pt, pc = list(prev["daily"]["t"]), list(prev["daily"]["c"])
+        if daily["c"][-1] == pc[-1]:  # 基準価額が前回と同じ = まだ新しい値が出ていない
+            pt, pc = pt[:-1], pc[:-1]
+        daily = {"t": pt + [daily["t"][-1]], "c": pc + [daily["c"][-1]], "v": [None] * (len(pt) + 1)}
 
     tz = meta.get("exchangeTimezoneName") or ("Asia/Tokyo" if sym.endswith(".T") else "America/New_York")
     price = meta.get("regularMarketPrice") or daily["c"][-1]
@@ -351,6 +409,7 @@ def main():
         "quotes": quotes,
         "marketNews": market_news or [],
         "marketNewsAt": prev_doc.get("marketNewsAt", int(now)),
+        "diag": DIAG,
     }
     if ok == 0:
         log("すべての銘柄で取得に失敗したため、ファイルは更新しません")
