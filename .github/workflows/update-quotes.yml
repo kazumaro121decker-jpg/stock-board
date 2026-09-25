@@ -1,4 +1,4 @@
-name: 株価データ更新
+name: 株価データ更新と公開
 
 on:
   schedule:
@@ -8,21 +8,21 @@ on:
     - cron: "7 */3 * * 0,6"
   push:
     branches: [main]
-    paths:
-      - data/watchlist.json
   workflow_dispatch:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
-  group: update-quotes
+  group: pages
   cancel-in-progress: false
 
 jobs:
-  update:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -34,21 +34,44 @@ jobs:
 
       - run: pip install -r scripts/requirements.txt
 
-      - name: 株価を取得
-        run: python scripts/fetch_quotes.py
-
-      - name: 変更をコミット
+      - name: サイトを組み立て
         run: |
-          git config user.name "stock-board-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/quotes.json
-          if git diff --cached --quiet; then
-            echo "変更なし"
-            exit 0
+          mkdir -p _site
+          cp -r index.html manifest.webmanifest sw.js .nojekyll css js icons _site/
+          mkdir -p _site/data
+          cp data/watchlist.json data/universe.json _site/data/
+
+      - name: 株価を取得
+        env:
+          PREV_STATE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/data/state.json
+        run: python scripts/fetch_quotes.py --out _site/data
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      # 60日間リポジトリに動きがないと定期実行が止まるため、月1回だけ記録を残す
+      - name: 定期実行の維持
+        if: github.event_name == 'schedule'
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 30 * 86400 )) ]; then
+            git config user.name "stock-board-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            date -u +%FT%TZ > .keepalive
+            git add .keepalive
+            git commit -m "定期実行の維持"
+            git push
           fi
-          git commit -m "データ更新 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
-          for i in 1 2 3; do
-            git pull --rebase -X theirs origin main && git push origin HEAD:main && exit 0
-            sleep 5
-          done
-          exit 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

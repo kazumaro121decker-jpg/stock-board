@@ -5,17 +5,21 @@ import {
 import { analyze, signalsFor, smaSeries, RECO } from './indicators.js';
 import { sparkline, mountChart } from './chart.js';
 import * as gh from './github.js';
-import { searchSymbols, SUGGEST } from './symbols.js';
+import { searchSymbols, setUniverse, universeEntry, universeSize, STARTER } from './symbols.js';
 
 // ===================== 状態 =====================
+// 銘柄の一覧・保有数・目標買値はすべて「この端末のブラウザ」に保存する(人ごとに別々)
 const DEFAULT_SETTINGS = { theme: 'auto', colors: 'jp', refreshMin: 5, pillMode: 'pct', holdSort: 'value', watchSort: 'change', chartMA: true, startTab: 'home' };
+const cachedDoc = store.get('lastDoc', null);
 const S = {
-  doc: store.get('lastDoc', null),
-  served: store.get('lastWatchlist', null),
+  doc: cachedDoc?.v === 2 ? cachedDoc : null,
+  served: store.get('lastWatchlist', null),  // data/watchlist.json (マーケット指標・作者のサンプル)
   settings: { ...DEFAULT_SETTINGS, ...store.get('settings', {}) },
+  my: store.get('my', null),               // {items: [{symbol, list:'hold'|'watch', name}]}
   holdings: store.get('holdings', {}),     // {sym: {qty, cost, fx}}
   targets: store.get('targets', {}),       // {sym: {target, memo}}
-  local: { adds: {}, removes: [], lists: {}, ...store.get('localEdits', {}) },
+  details: new Map(),                      // 詳細チャート用データのキャッシュ
+  newsDoc: null,
   tab: 'home',
   newsFilter: 'all',
   loading: false,
@@ -23,35 +27,46 @@ const S = {
   installEvt: null,
 };
 const saveSettings = () => store.set('settings', S.settings);
-const saveLocal = () => store.set('localEdits', S.local);
+const saveMy = () => store.set('my', S.my);
 
 const TABS = { home: 'ホーム', hold: '保有銘柄', watch: 'ウォッチ', news: 'ニュース', settings: '設定' };
 const PALETTE = ['#5b8def', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#64748b'];
 
 // ===================== データ =====================
 const Q = (sym) => S.doc?.quotes?.[sym] || null;
+const nameOf = (sym) => universeEntry(sym)?.n || (S.served?.symbols || []).find((x) => x.symbol === sym)?.name || Q(sym)?.name || sym;
 
 function allItems() {
-  const base = S.served?.symbols || [];
-  const map = new Map();
-  for (const it of base) map.set(it.symbol, { ...it });
-  for (const [sym, it] of Object.entries(S.local.adds)) if (!map.has(sym)) map.set(sym, { ...it, pending: true });
-  for (const sym of S.local.removes) map.delete(sym);
-  for (const [sym, list] of Object.entries(S.local.lists)) if (map.has(sym)) map.get(sym).list = list;
-  return [...map.values()].map((it) => {
+  return (S.my?.items || []).map((it) => {
     const q = Q(it.symbol);
-    return { ...it, pending: it.pending || !q || !!q.error, q };
+    return { ...it, name: it.name || nameOf(it.symbol), pending: !q || !!q.error, q };
   });
 }
 const items = (list) => allItems().filter((i) => i.list === list);
+const inMyList = (sym) => (S.my?.items || []).some((i) => i.symbol === sym);
 
-// 反映済みのローカル変更を片付ける
-function pruneLocal() {
-  const served = new Map((S.served?.symbols || []).map((i) => [i.symbol, i]));
-  for (const sym of Object.keys(S.local.adds)) if (served.has(sym)) delete S.local.adds[sym];
-  S.local.removes = S.local.removes.filter((s) => served.has(s));
-  for (const [sym, l] of Object.entries(S.local.lists)) if (!served.has(sym) || served.get(sym).list === l) delete S.local.lists[sym];
-  saveLocal();
+// 初回: 旧バージョンで使っていた端末(保有数の入力あり)は、作者の銘柄一覧を引き継ぐ
+function initMyList() {
+  if (S.my) return;
+  const old = store.get('localEdits', null);
+  const used = Object.keys(S.holdings).length || Object.keys(S.targets).length || old;
+  if (!used) { S.my = { items: [] }; saveMy(); return; }
+  if (!S.served) return; // watchlist の読み込み待ち
+  const list = (S.served.symbols || []).map((x) => ({ symbol: x.symbol, list: x.list || 'watch', name: x.name }));
+  if (old) {
+    for (const [sym, it] of Object.entries(old.adds || {})) if (!list.some((x) => x.symbol === sym)) list.push({ symbol: sym, list: it.list || 'watch', name: it.name });
+    for (const x of list) if (old.lists?.[x.symbol]) x.list = old.lists[x.symbol];
+  }
+  S.my = { items: list.filter((x) => !(old?.removes || []).includes(x.symbol)) };
+  saveMy();
+}
+
+function addToMy(sym, list, name) {
+  S.my ||= { items: [] };
+  const cur = S.my.items.find((i) => i.symbol === sym);
+  if (cur) cur.list = list;
+  else S.my.items.push({ symbol: sym, list, ...(name ? { name } : {}) });
+  saveMy();
 }
 
 function usdjpy() { return Q('JPY=X')?.price || null; }
@@ -91,7 +106,7 @@ function portfolio() {
     if (!p) continue;
     n++; value += p.value; dayPL += p.dayPL;
     if (p.cost != null) { cost += p.cost; plValue += p.value; }
-    parts.push({ sym: it.symbol, name: it.q?.name || it.name, value: p.value });
+    parts.push({ sym: it.symbol, name: it.name, value: p.value });
   }
   parts.sort((a, b) => b.value - a.value);
   const prev = value - dayPL;
@@ -99,34 +114,51 @@ function portfolio() {
 }
 
 // ===================== データ取得 =====================
+const bust = () => `?_=${Date.now()}`;
+async function getJSON(path, fresh = true) {
+  const r = await fetch(path + (fresh ? bust() : ''), { cache: fresh ? 'no-store' : 'default' });
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
 async function refresh({ silent = false } = {}) {
   if (S.loading) return;
   S.loading = true;
   $('#refresh-btn').classList.add('spin');
   try {
-    const [docRes, wlRes] = await Promise.all([
-      fetch(`data/quotes.json?_=${Date.now()}`, { cache: 'no-store' }),
-      fetch(`data/watchlist.json?_=${Date.now()}`, { cache: 'no-store' }),
+    const [doc, wl, uni] = await Promise.allSettled([
+      getJSON('data/quotes.json'),
+      getJSON('data/watchlist.json'),
+      universeSize() ? Promise.resolve(null) : getJSON('data/universe.json'),
     ]);
-    if (wlRes.ok) { S.served = await wlRes.json(); store.set('lastWatchlist', S.served); }
-    if (docRes.ok) {
-      const doc = await docRes.json();
-      const changed = doc.generatedAt !== S.doc?.generatedAt;
-      S.doc = doc;
-      store.set('lastDoc', doc);
+    if (wl.status === 'fulfilled') { S.served = wl.value; store.set('lastWatchlist', S.served); }
+    if (uni.status === 'fulfilled' && uni.value) { setUniverse(uni.value); store.set('universe', uni.value); }
+    if (doc.status === 'fulfilled' && doc.value?.v === 2) {
+      const changed = doc.value.generatedAt !== S.doc?.generatedAt;
+      S.doc = doc.value;
+      if (changed) { S.details.clear(); S.newsDoc = null; }
+      store.set('lastDoc', S.doc);
       if (!silent && !changed) toast('最新のデータです');
-    } else if (!S.doc) {
-      S.doc = null;
-    }
-    pruneLocal();
+    } else if (!silent) toast('通信できませんでした。前回のデータを表示しています');
+    initMyList();
     S.lastFetch = Date.now();
-  } catch (e) {
-    if (!silent) toast('通信できませんでした。前回のデータを表示しています');
   } finally {
     S.loading = false;
     $('#refresh-btn').classList.remove('spin');
     render();
   }
+}
+
+const fileKey = (sym) => sym.replace(/[^A-Za-z0-9.\-]/g, '_');
+async function loadDetail(sym) {
+  if (S.details.has(sym)) return S.details.get(sym);
+  const d = await getJSON(`data/detail/${fileKey(sym)}.json`).catch(() => null);
+  if (d) S.details.set(sym, d);
+  return d;
+}
+async function loadNews() {
+  if (!S.newsDoc) S.newsDoc = await getJSON('data/news.json').catch(() => ({ news: {} }));
+  return S.newsDoc;
 }
 
 let timer;
@@ -179,10 +211,9 @@ function lastSession(series) {
 }
 
 function sparkFor(q, w = 64, h = 30) {
-  if (!q) return '';
-  const s = q.type !== 'fund' ? lastSession(q.intraday) : null;
-  if (s && s.c.length > 3) return sparkline(s.c, { base: q.prevClose, dir: cls(q.change), w, h });
-  const c = q.daily?.c?.slice(-22) || [];
+  if (!q?.spark) return '';
+  const c = q.spark;
+  if (q.sparkBase != null) return sparkline(c, { base: q.sparkBase, dir: cls(q.change), w, h });
   return sparkline(c, { dir: cls((c[c.length - 1] ?? 0) - (c[0] ?? 0)), w, h });
 }
 
@@ -213,7 +244,7 @@ function rowHTML(it, { list, extra = true } = {}) {
   const code = esc(it.symbol.replace(/\.T$/, ''));
   if (it.pending) {
     return `<button class="row row-pending" data-sym="${esc(it.symbol)}">
-      <div class="row-main"><div class="row-name">${name}</div><div class="row-sub">${code}・${q?.error ? '取得できませんでした(コードを確認)' : 'データ取得待ち'}</div></div>
+      <div class="row-main"><div class="row-name">${name}</div><div class="row-sub">${code}・${q?.error ? '取得できませんでした(コードを確認)' : S.doc ? '株価の取得対象外' : 'データ取得待ち'}</div></div>
       <div class="row-spark"></div><div class="row-right"><span class="pill flat">—</span></div></button>`;
   }
   const mode = PILL_MODES[list]?.includes(S.settings.pillMode) ? S.settings.pillMode : 'pct';
@@ -279,7 +310,7 @@ function allSignals() {
 
 const signalHTML = (s) => `<button class="signal" data-sym="${esc(s.it.symbol)}">
   <span class="s-ico">${s.icon}</span>
-  <span class="s-text"><b>${esc(s.it.q?.name || s.it.name)}</b> <span class="chip ${s.level}">${esc(s.label)}</span>${s.desc ? `<div>${esc(s.desc)}</div>` : ''}</span></button>`;
+  <span class="s-text"><b>${esc(s.it.name || s.it.q?.name)}</b> <span class="chip ${s.level}">${esc(s.label)}</span>${s.desc ? `<div>${esc(s.desc)}</div>` : ''}</span></button>`;
 
 const icoInfo = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v5h1"/></svg>';
 
@@ -325,6 +356,24 @@ function installBanner() {
     <button class="icon-btn" data-action="install-dismiss" aria-label="閉じる"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>`;
 }
 
+// はじめて開いた人向け: 銘柄を選んでもらう
+function welcomeHTML() {
+  const n = S.my?.items?.length || 0;
+  if (!S.doc || n >= 5 || (n && store.get('welcomeDone', false))) return '';
+  const chips = STARTER.filter((s) => Q(s) && !Q(s).error && !inMyList(s)).map((s) => `<button class="chip info" data-quick="${esc(s)}">＋ ${esc(nameOf(s))}</button>`).join('');
+  const sample = (S.served?.symbols || []).length;
+  return `<div class="card card-pad section">
+    <div class="d-head"><h2 style="margin:0 0 4px;font-size:18px">ようこそ 👋</h2>${n ? '<button class="icon-btn" data-action="welcome-done" aria-label="閉じる"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>' : ''}</div>
+    <p style="margin:0 0 12px" class="small">気になる銘柄を追加すると、値動き・損益・売買シグナルを一目で確認できます。銘柄の一覧や保有数は<b>この端末の中だけ</b>に保存され、他の人には見えません。</p>
+    <div class="btn-row" style="margin-bottom:12px">
+      <button class="btn primary" data-action="add" data-list="watch">銘柄を探して追加</button>
+      ${sample ? `<button class="btn" data-action="load-sample">サンプル(${sample}銘柄)を読み込む</button>` : ''}
+    </div>
+    <div class="small muted" style="margin-bottom:6px">人気の銘柄をワンタップで追加(ウォッチに入ります)</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px">${chips}</div>
+  </div>`;
+}
+
 function summaryHTML() {
   const p = portfolio();
   const holdCount = items('hold').length;
@@ -353,8 +402,8 @@ function viewHome() {
   const watch = sortItems(items('watch'), 'change').slice(0, 6);
   const sigs = allSignals().slice(0, 8);
   const news = (S.doc?.marketNews || []).slice(0, 6);
-  return `${installBanner()}${setupNotice()}
-  <div class="section">${summaryHTML()}</div>
+  return `${installBanner()}${setupNotice()}${welcomeHTML()}
+  ${S.my?.items?.length ? `<div class="section">${summaryHTML()}</div>` : ''}
   <div class="section"><div class="section-head"><h2>マーケット</h2></div>
     <div class="tiles ${S.settings.tilesOpen ? '' : 'collapsed'}">${markets.map(tileHTML).join('') || '<div class="muted">—</div>'}</div>
     ${markets.length > 6 ? `<button class="tiles-more" data-set="tilesOpen" data-val="${S.settings.tilesOpen ? '' : '1'}">${S.settings.tilesOpen ? '閉じる ▲' : `すべて表示(ほか${markets.length - 6}件) ▼`}</button>` : ''}</div>
@@ -418,17 +467,19 @@ function viewWatch() {
 }
 
 function viewNews() {
-  const syms = allItems().filter((it) => it.q?.news?.length);
-  const chips = [['all', 'すべて'], ['market', 'マーケット'], ...syms.map((it) => [it.symbol, it.q.name || it.name])];
+  if (!S.newsDoc) loadNews().then(() => { if (S.tab === 'news') render(); });
+  const newsOf = (sym) => S.newsDoc?.news?.[sym] || [];
+  const syms = allItems().filter((it) => newsOf(it.symbol).length);
+  const chips = [['all', 'すべて'], ['market', 'マーケット'], ...syms.map((it) => [it.symbol, it.name])];
   let list = [];
   const f = S.newsFilter;
   if (f === 'all' || f === 'market') list.push(...(S.doc?.marketNews || []).map((n) => ({ n, sym: f === 'all' ? '市況' : '' })));
-  for (const it of syms) if (f === 'all' || f === it.symbol) list.push(...it.q.news.map((n) => ({ n, sym: it.q.name || it.name })));
+  for (const it of syms) if (f === 'all' || f === it.symbol) list.push(...newsOf(it.symbol).map((n) => ({ n, sym: it.name })));
   const seen = new Set();
   list = list.filter(({ n }) => (seen.has(n.title) ? false : seen.add(n.title))).sort((a, b) => (b.n.t || 0) - (a.n.t || 0));
   return `<div class="toolbar"><div class="seg scroll-x" style="max-width:100%">${chips.map(([k, l]) => `<button data-news="${esc(k)}" aria-pressed="${f === k}">${esc(l)}</button>`).join('')}</div></div>
   <div class="card">${list.slice(0, 60).map(({ n, sym }) => newsHTML(n, sym)).join('') || '<div class="empty">ニュースはまだありません</div>'}</div>
-  <p class="muted small" style="margin-top:12px">Google ニュースの見出しを1時間ごとに取得しています。</p>`;
+  <p class="muted small" style="margin-top:12px">Google ニュースの見出しを数時間ごとに取得しています。</p>`;
 }
 
 function viewSettings() {
@@ -457,9 +508,24 @@ function viewSettings() {
     ${ios ? '<p class="muted small" style="margin:10px 0 0">ヒント: iPhone の「ショートカット」アプリのオートメーションで、毎朝決まった時刻にこのアプリを開く設定もできます。</p>' : ''}
   </div></div>
 
-  <div class="section"><div class="section-head"><h2>銘柄の追加・削除を反映 (GitHub 連携)</h2></div>
+  <div class="section"><div class="section-head"><h2>ほかの人にこのアプリを紹介</h2></div>
   <div class="card card-pad">
-    <p style="margin:0 0 10px" class="small">銘柄を追加・削除したとき、株価の取得対象(リポジトリの <code>data/watchlist.json</code>)を自動で書き換えるための設定です。<b>端末ごとに1回</b>設定してください。トークンはこの端末の中だけに保存されます。</p>
+    <p style="margin:0 0 10px" class="small">このページのURLを送るだけで、だれでも使えます。登録なし・無料です。銘柄の一覧・保有数・目標買値は<b>各自の端末の中だけ</b>に保存されるので、あなたの保有内容が相手に見えることはありません。</p>
+    <div class="btn-row">
+      <button class="btn primary" data-action="share-app">アプリのURLを送る</button>
+      <button class="btn" data-action="share-list" ${S.my?.items?.length ? '' : 'disabled'}>自分の銘柄リストを送る</button>
+    </div>
+    <p class="muted small" style="margin:8px 0 0">「銘柄リストを送る」は銘柄の名前だけを共有します(保有数や金額は含まれません)。相手がリンクを開くと、同じ銘柄をまとめて追加できます。</p>
+  </div></div>
+
+  <div class="section"><div class="section-head"><h2>バックアップ・機種変更</h2></div>
+  <div class="card card-pad">
+    <p style="margin:0 0 10px" class="small">銘柄の一覧・保有数・取得単価・目標買値はこの端末に保存されています。パソコンとスマホで同じ内容を使うときは、書き出したデータをもう一方で読み込んでください。</p>
+    <div class="btn-row"><button class="btn" data-action="export">データを書き出す(コピー)</button><button class="btn" data-action="import">データを読み込む</button></div>
+  </div></div>
+
+  <details class="section card card-pad" ${c.token ? 'open' : ''}><summary style="cursor:pointer;font-weight:800">管理者向け: 取得対象の銘柄を増やす (GitHub 連携)</summary>
+    <p class="small" style="margin:10px 0">株価は共通の銘柄一覧(約${universeSize() || 250}銘柄)について自動で取得しています。一覧にない銘柄をコードで追加したとき、取得対象に加えるための設定です。<b>アプリの管理者(リポジトリの持ち主)だけ</b>が使います。トークンはこの端末の中だけに保存されます。</p>
     <div class="fields">
       <div class="field"><label for="gh-repo">リポジトリ (ユーザー名/リポジトリ名)</label><input id="gh-repo" value="${esc(c.repo)}" placeholder="yourname/stock-board" autocomplete="off" autocapitalize="off"></div>
       <div class="field"><label for="gh-token">アクセストークン</label><input id="gh-token" type="password" value="${esc(c.token)}" placeholder="github_pat_..." autocomplete="off"></div>
@@ -473,17 +539,11 @@ function viewSettings() {
       <li>Repository access で「Only select repositories」→ このアプリのリポジトリを選択</li>
       <li>Permissions の Repository permissions で <b>Contents: Read and write</b>(「今すぐ取得」も使うなら <b>Actions: Read and write</b> も)</li>
       <li>「Generate token」で作成し、表示された文字列を上の欄に貼り付け</li></ol></details>
-  </div></div>
-
-  <div class="section"><div class="section-head"><h2>バックアップ・機種変更</h2></div>
-  <div class="card card-pad">
-    <p style="margin:0 0 10px" class="small">保有数・取得単価・目標買値などはこの端末に保存されています。パソコンとスマホで同じ内容を使うときは、書き出したデータをもう一方で読み込んでください。</p>
-    <div class="btn-row"><button class="btn" data-action="export">データを書き出す(コピー)</button><button class="btn" data-action="import">データを読み込む</button></div>
-  </div></div>
+  </details>
 
   <div class="section"><div class="section-head"><h2>このアプリについて</h2></div>
   <div class="card card-pad small">
-    <p style="margin-top:0">株価: Yahoo Finance(平日は約15分ごとに自動取得、最大20分程度の遅延)。投資信託は1日1回の基準価額。ニュース: Google ニュース。</p>
+    <p style="margin-top:0">株価: Yahoo Finance(平日は約15分ごとに自動取得、最大20分程度の遅延)。投資信託は1日1回の基準価額(投資信託協会)。ニュース: Google ニュース。</p>
     <p>最終データ更新: ${S.doc?.generatedAt ? fmtDateTime(Date.parse(S.doc.generatedAt) / 1000) : '—'}</p>
     <p style="margin-bottom:0" class="muted">表示される情報とシグナルは参考情報であり、投資の勧誘や助言ではありません。売買の判断はご自身の責任で行ってください。</p>
   </div></div>`;
@@ -535,14 +595,14 @@ function openDetail(sym) {
   const name = market?.name || it?.name || q?.name || sym;
   if (!q || q.error) {
     openSheet(`<div class="d-head"><div><h2 class="d-title" id="sheet-title">${esc(name)}</h2><div class="d-sym">${esc(sym)}</div></div>${closeBtn()}</div>
-      <div class="notice warn" style="margin-top:14px">${icoInfo}<div>${q?.error ? 'このコードでは株価を取得できませんでした。コードが正しいか確認してください(日本株は「7203」のように4桁、米国株はティッカー)。' : 'まだ株価データがありません。次回の自動取得(最大15分程度)で表示されます。'}</div></div>
+      <div class="notice warn" style="margin-top:14px">${icoInfo}<div>${q?.error ? 'このコードでは株価を取得できませんでした。コードが正しいか確認してください(日本株は「7203」のように4桁、米国株はティッカー)。' : S.doc ? 'この銘柄は、まだ株価の自動取得の対象に入っていません。アプリの管理者が取得対象に追加すると表示されるようになります。' : 'まだ株価データがありません。'}</div></div>
       ${list ? manageHTML(sym, list) : ''}`);
     return;
   }
   const a = analyze(q);
   const f = q.fundamentals || {};
-  const hasIntra = q.intraday?.t?.length > 3;
-  const ranges = [['1D', '1日'], ['5D', '5日'], ['1M', '1ヶ月'], ['6M', '6ヶ月'], ['1Y', '1年'], ['5Y', '5年']].filter(([k]) => (hasIntra || !['1D', '5D'].includes(k)) && (k !== '5Y' || q.weekly?.t?.length));
+  const hasIntra = !!q.hasIntraday;
+  const ranges = [['1D', '1日'], ['5D', '5日'], ['1M', '1ヶ月'], ['6M', '6ヶ月'], ['1Y', '1年'], ['5Y', '5年']].filter(([k]) => (hasIntra || !['1D', '5D'].includes(k)) && (k !== '5Y' || q.hasWeekly));
   const range = store.get('range', '1D');
   const cur = ranges.some(([k]) => k === range) ? range : ranges[0][0];
   const sigs = signalsFor(q, a, { target: S.targets[sym]?.target });
@@ -593,22 +653,33 @@ function openDetail(sym) {
     <div class="d-price num">${fmtPrice(q.price, q)}${q.type === 'rate' ? '%' : ''}</div>
     <div class="d-chg num ${cls(q.change)}">${fmtChange(q.change, q)} (${fmtPct(q.changePct)}) <span class="muted small">前日比</span></div>
     <div class="d-time">${q.type === 'fund' ? '基準価額 ' + fmtDate(q.marketTime) : fmtDateTime(q.marketTime) + ' 時点'}${q.stale ? '・<span style="color:var(--warn)">最新の取得に失敗(前回の値)</span>' : ''}</div>
-    <div class="chart-wrap" id="chart"></div>
+    <div class="chart-wrap" id="chart"><div class="skeleton" style="height:100%"></div></div>
     <div class="seg range-tabs" role="group" aria-label="期間">${ranges.map(([k, l]) => `<button data-range="${k}" aria-pressed="${k === cur}">${l}</button>`).join('')}</div>
     <div class="chart-opts"><label><input type="checkbox" id="ma-toggle" ${S.settings.chartMA ? 'checked' : ''}> 移動平均線 <span style="color:#f59e0b">━25日</span> <span style="color:#8b5cf6">━75日</span></label></div>
 
     ${sigs.length ? `<div class="section"><div class="section-head"><h2>シグナル</h2></div><div class="card signals">${sigs.map((s) => signalHTML({ ...s, it: { symbol: sym, name, q } })).join('')}</div></div>` : ''}
-    ${list ? manageHTML(sym, list) : ''}
+    ${list ? manageHTML(sym, list) : market ? '' : `<div class="section btn-row"><button class="btn primary" data-action="quick-add" data-sym="${esc(sym)}" data-list="watch">＋ ウォッチに追加</button><button class="btn" data-action="quick-add" data-sym="${esc(sym)}" data-list="hold">＋ 保有銘柄に追加</button></div>`}
     <div class="section"><div class="section-head"><h2>株価情報</h2></div><div class="card card-pad" style="padding-top:4px"><div class="stats">${statsArr}</div></div></div>
     ${tech ? `<div class="section"><div class="section-head"><h2>テクニカル指標</h2></div><div class="card card-pad" style="padding-top:4px">${tech}</div></div>` : ''}
     ${analyst}
-    ${q.news?.length ? `<div class="section"><div class="section-head"><h2>ニュース</h2></div><div class="card">${q.news.map((n) => newsHTML(n)).join('')}</div></div>` : ''}
+    <div id="d-news"></div>
     <div class="section"><div class="section-head"><h2>くわしく見る</h2></div><div class="links">${extLinks(sym, q)}</div></div>
     ${list ? `<div class="section btn-row"><button class="btn" data-action="move" data-sym="${esc(sym)}" data-to="${list === 'hold' ? 'watch' : 'hold'}">${list === 'hold' ? 'ウォッチへ移動' : '保有銘柄へ移動'}</button><button class="btn danger" data-action="remove" data-sym="${esc(sym)}">一覧から削除</button></div>` : ''}
   `);
-  drawDetailChart(q, cur);
+  curDetail = null;
   bindDetail(sym, q);
+  loadDetail(sym).then((d) => {
+    if ($('#sheet-title')?.textContent !== name) return; // 別の銘柄に切り替わった
+    curDetail = d;
+    drawDetailChart(q, $('#sheet-body [data-range][aria-pressed="true"]')?.dataset.range || cur);
+  });
+  if (!market) loadNews().then((nd) => {
+    const n = nd?.news?.[sym];
+    const el = $('#d-news');
+    if (el && n?.length) el.innerHTML = `<div class="section"><div class="section-head"><h2>ニュース</h2></div><div class="card">${n.map((x) => newsHTML(x)).join('')}</div></div>`;
+  });
 }
+let curDetail = null;
 
 const closeBtn = () => `<button class="icon-btn" data-action="close" aria-label="閉じる"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>`;
 
@@ -651,12 +722,14 @@ function drawDetailChart(q, range) {
   unmountChart?.();
   const el = $('#chart');
   if (!el) return;
+  const d = curDetail;
+  if (!d) { el.innerHTML = '<div class="chart-empty">チャートを読み込めませんでした</div>'; return; }
   let series, base = null, fmtT, fmtTip, overlays = [];
   const md = new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric' });
   const ym = new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: 'numeric' });
   const f = (fm) => (t) => fm.format(new Date(t * 1000));
   const dailyWithMA = (n) => {
-    const all = { t: [...q.daily.t], c: [...q.daily.c] };
+    const all = { t: [...d.daily.t], c: [...d.daily.c] };
     if (all.c.length) all.c[all.c.length - 1] = q.price;
     const k = Math.max(0, all.c.length - n);
     if (S.settings.chartMA) {
@@ -666,12 +739,12 @@ function drawDetailChart(q, range) {
     return { t: all.t.slice(k), c: all.c.slice(k) };
   };
   switch (range) {
-    case '1D': series = lastSession(q.intraday); base = q.prevClose; fmtT = fmtTime; fmtTip = fmtDateTime; break;
-    case '5D': series = q.intraday; fmtT = f(md); fmtTip = fmtDateTime; break;
+    case '1D': series = lastSession(d.intraday); base = q.prevClose; fmtT = fmtTime; fmtTip = fmtDateTime; break;
+    case '5D': series = d.intraday; fmtT = f(md); fmtTip = fmtDateTime; break;
     case '1M': series = dailyWithMA(22); fmtT = f(md); fmtTip = fmtDate; break;
     case '6M': series = dailyWithMA(126); fmtT = f(md); fmtTip = fmtDate; break;
     case '1Y': series = dailyWithMA(400); fmtT = f(ym); fmtTip = fmtDate; break;
-    case '5Y': series = q.weekly; fmtT = f(ym); fmtTip = fmtDate; break;
+    case '5Y': series = d.weekly; fmtT = f(ym); fmtTip = fmtDate; break;
   }
   const dir = series?.c?.length ? cls(series.c[series.c.length - 1] - (base ?? series.c[0])) : 'flat';
   unmountChart = mountChart(el, series, { base, dir: dir === 'flat' ? 'up' : dir, fmt: (v) => fmtPrice(v, q), fmtT, fmtTip, overlays });
@@ -717,10 +790,9 @@ function openAdd(list = 'watch') {
   openSheet(`<div class="d-head"><div><h2 class="d-title" id="sheet-title">銘柄を追加</h2><div class="d-sym">名前・証券コード・ティッカーで検索</div></div>${closeBtn()}</div>
     <div class="seg" style="margin-top:14px" role="group" aria-label="追加先">
       <button data-addlist="watch" aria-pressed="${list === 'watch'}">ウォッチ(買い検討)</button><button data-addlist="hold" aria-pressed="${list === 'hold'}">保有銘柄</button></div>
-    <div class="field" style="margin-top:12px"><input id="add-q" type="search" placeholder="例: トヨタ / 7203 / AAPL / 0331418A" autocomplete="off" autocapitalize="characters" enterkeyhint="search"></div>
+    <div class="field" style="margin-top:12px"><input id="add-q" type="search" placeholder="例: トヨタ / 7203 / AAPL / オルカン" autocomplete="off" autocapitalize="characters" enterkeyhint="search"></div>
     <div class="card suggest" id="add-results"></div>
-    <p class="muted small">日本株は4桁の証券コード(例: 7203)、米国株はティッカー(例: AAPL)、投資信託は8桁の協会コード(例: 0331418A)で、一覧にない銘柄も追加できます。</p>
-    ${gh.isConnected() ? '' : `<div class="notice warn">${icoInfo}<div>GitHub 連携が未設定のため、追加した銘柄は「データ取得待ち」のままになります。<button class="link" style="background:none;border:0;color:var(--accent);font-weight:700;padding:0" data-action="goto-settings">設定する</button></div></div>`}`);
+    <p class="muted small">日本株・米国株・ETF・投資信託など約${universeSize() || 250}銘柄の株価を自動取得しています。検索に出ない銘柄は、日本株は4桁の証券コード(例: 7203)、米国株はティッカー(例: AAPL)で追加できます${gh.isConnected() ? '(取得対象にも自動で追加されます)' : '(取得対象に入るまでは価格が表示されません)'}。</p>`);
   const body = $('#sheet-body');
   let addList = list;
   body.querySelectorAll('[data-addlist]').forEach((b) => b.addEventListener('click', () => {
@@ -729,13 +801,19 @@ function openAdd(list = 'watch') {
   }));
   const input = $('#add-q', body), res = $('#add-results', body);
   const existing = new Set(allItems().map((i) => i.symbol));
+  const extra = (S.served?.symbols || []).map((x) => ({ s: x.symbol, n: x.name, a: '' }));
   const draw = () => {
     const v = input.value;
-    const hits = searchSymbols(v);
+    const hits = searchSymbols(v, 15, extra);
     const raw = normalizeSymbol(v);
     if (raw && /^[\w.^=-]+$/.test(raw) && !hits.some((h) => h.symbol === raw)) hits.push({ symbol: raw, name: `「${raw}」をコードとして追加`, raw: true });
-    res.innerHTML = hits.map((h) => `<button data-pick="${esc(h.symbol)}" data-name="${esc(h.raw ? '' : h.name)}">
-      <span>${esc(h.name)}</span><span class="s-code">${existing.has(h.symbol) ? '追加済み' : esc(h.symbol.replace(/\.T$/, ''))}</span></button>`).join('');
+    res.innerHTML = hits.map((h) => {
+      const q = Q(h.symbol);
+      const right = existing.has(h.symbol) ? '追加済み'
+        : q && !q.error ? `<span class="num ${cls(q.change)}">${fmtPrice(q.price, q)} ${fmtPct(q.changePct)}</span>`
+        : esc(h.symbol.replace(/\.T$/, ''));
+      return `<button data-pick="${esc(h.symbol)}" data-name="${esc(h.raw ? '' : h.name)}"><span>${esc(h.name)}<span class="s-code" style="margin-left:6px">${esc(h.symbol.replace(/\.T$/, ''))}</span></span><span class="s-code">${right}</span></button>`;
+    }).join('');
     res.style.display = hits.length ? '' : 'none';
   };
   input.addEventListener('input', draw);
@@ -750,54 +828,80 @@ function openAdd(list = 'watch') {
   setTimeout(() => input.focus(), 250);
 }
 
-async function addSymbol(sym, name, list) {
-  const known = SUGGEST.find(([s]) => s === sym);
-  const item = { symbol: sym, name: name || known?.[1] || sym, list, type: guessType(sym) };
-  S.local.adds[sym] = item;
-  S.local.removes = S.local.removes.filter((s) => s !== sym);
-  saveLocal();
-  closeSheet();
-  S.tab = list; render();
-  if (!gh.isConnected()) { toast('追加しました(GitHub 連携を設定すると株価が取得されます)', 4000); return; }
-  toast('追加しています…');
+async function addSymbol(sym, name, list, { stay = false } = {}) {
+  const fetched = Q(sym) && !Q(sym).error;
+  const label = name || nameOf(sym);
+  addToMy(sym, list, universeEntry(sym) ? undefined : label !== sym ? label : undefined);
+  if (!stay) { closeSheet(); S.tab = list; }
+  render();
+  if (fetched) { toast(`${label} を${list === 'hold' ? '保有銘柄' : 'ウォッチ'}に追加しました`); return; }
+  // 株価の取得対象に入っていない銘柄
+  if (!gh.isConnected()) { toast('追加しました。この銘柄は株価の取得対象外のため、価格は表示されません', 5000); return; }
+  toast('取得対象に追加しています…');
   try {
     await gh.updateWatchlist((d) => {
       d.symbols ||= [];
-      if (!d.symbols.some((s) => s.symbol === sym)) d.symbols.push(item);
-    }, `銘柄を追加: ${item.name} (${sym})`);
-    toast('追加しました。1〜3分ほどで株価が表示されます', 4000);
+      if (!d.symbols.some((s) => s.symbol === sym)) d.symbols.push({ symbol: sym, name: label, type: guessType(sym) });
+    }, `取得対象に追加: ${label} (${sym})`);
+    toast('追加しました。3〜5分ほどで株価が表示されます', 4000);
   } catch (e) { toast(e.message, 5000); }
 }
 
-async function removeSymbol(sym) {
+function removeSymbol(sym) {
   const it = allItems().find((i) => i.symbol === sym);
   if (!confirm(`「${it?.name || sym}」を一覧から削除しますか？`)) return;
-  delete S.local.adds[sym];
-  if ((S.served?.symbols || []).some((s) => s.symbol === sym)) S.local.removes.push(sym);
-  saveLocal();
+  S.my.items = S.my.items.filter((i) => i.symbol !== sym);
+  saveMy();
   closeSheet(); render();
-  if (!gh.isConnected()) { toast('この端末の一覧から削除しました'); return; }
-  try {
-    await gh.updateWatchlist((d) => { d.symbols = (d.symbols || []).filter((s) => s.symbol !== sym); }, `銘柄を削除: ${sym}`);
-    toast('削除しました');
-  } catch (e) { toast(e.message, 5000); }
+  toast('一覧から削除しました');
 }
 
-async function moveSymbol(sym, to) {
-  S.local.lists[sym] = to;
-  if (S.local.adds[sym]) S.local.adds[sym].list = to;
-  saveLocal();
+function moveSymbol(sym, to) {
+  addToMy(sym, to);
   closeSheet(); render();
   toast(to === 'hold' ? '保有銘柄に移動しました' : 'ウォッチに移動しました');
-  if (!gh.isConnected()) return;
-  try {
-    await gh.updateWatchlist((d) => { for (const s of d.symbols || []) if (s.symbol === sym) s.list = to; }, `銘柄を移動: ${sym} → ${to}`);
-  } catch (e) { toast(e.message, 5000); }
+}
+
+function loadSample() {
+  for (const x of S.served?.symbols || []) if (!inMyList(x.symbol)) addToMy(x.symbol, 'watch', universeEntry(x.symbol) ? undefined : x.name);
+  render();
+  toast('サンプルの銘柄をウォッチに追加しました');
+}
+
+// ===================== 共有 =====================
+const appURL = () => location.origin + location.pathname;
+
+async function shareOrCopy(title, text, url) {
+  if (navigator.share) {
+    try { await navigator.share({ title, text, url }); return; } catch (e) { if (e?.name === 'AbortError') return; }
+  }
+  try { await navigator.clipboard.writeText(`${text}\n${url}`); toast('リンクをコピーしました。LINE やメールに貼り付けて送ってください', 4500); }
+  catch { prompt('このリンクをコピーして送ってください', url); }
+}
+
+// 銘柄リストを URL にする: ?list=NVDA.h,AMD.w  (h=保有, w=ウォッチ。保有数などは含めない)
+function listShareURL() {
+  const v = (S.my?.items || []).map((i) => `${i.symbol}${i.list === 'hold' ? '!h' : '!w'}`).join(',');
+  return `${appURL()}?list=${encodeURIComponent(v)}`;
+}
+
+function checkSharedList() {
+  const p = new URLSearchParams(location.search).get('list');
+  if (!p) return;
+  history.replaceState(null, '', appURL() + location.hash);
+  const entries = p.split(',').map((x) => x.split('!')).filter(([s]) => /^[\w.^=-]{1,20}$/.test(s || ''));
+  if (!entries.length) return;
+  const names = entries.slice(0, 8).map(([s]) => nameOf(s)).join('、') + (entries.length > 8 ? ` ほか${entries.length - 8}件` : '');
+  if (!confirm(`共有された銘柄リスト(${entries.length}件)を追加しますか？\n\n${names}\n\n※ すでにある銘柄はそのままです。`)) return;
+  let n = 0;
+  for (const [s] of entries) if (!inMyList(s)) { addToMy(s, 'watch'); n++; }
+  render();
+  toast(`${n}件をウォッチに追加しました`);
 }
 
 // ===================== バックアップ =====================
 async function exportData() {
-  const data = JSON.stringify({ v: 1, holdings: S.holdings, targets: S.targets, settings: S.settings, local: S.local });
+  const data = JSON.stringify({ v: 2, my: S.my, holdings: S.holdings, targets: S.targets, settings: S.settings });
   try { await navigator.clipboard.writeText(data); toast('クリップボードにコピーしました。もう一方の端末で「読み込む」に貼り付けてください', 5000); }
   catch { prompt('このテキストをコピーしてください', data); }
 }
@@ -806,10 +910,10 @@ function importData() {
   if (!txt) return;
   try {
     const d = JSON.parse(txt);
+    if (d.my?.items) { S.my = d.my; saveMy(); }
     if (d.holdings) { S.holdings = d.holdings; store.set('holdings', S.holdings); }
     if (d.targets) { S.targets = d.targets; store.set('targets', S.targets); }
     if (d.settings) { S.settings = { ...DEFAULT_SETTINGS, ...d.settings }; saveSettings(); applyTheme(); }
-    if (d.local) { S.local = { adds: {}, removes: [], lists: {}, ...d.local }; saveLocal(); }
     toast('読み込みました'); render();
   } catch { toast('データの形式が正しくありません'); }
 }
@@ -831,7 +935,7 @@ function go(tab) {
 }
 
 document.addEventListener('click', async (e) => {
-  const el = e.target.closest('[data-pill],[data-sym],[data-tab],[data-tab-go],[data-action],[data-sort],[data-set],[data-news]');
+  const el = e.target.closest('[data-pill],[data-quick],[data-sym],[data-tab],[data-tab-go],[data-action],[data-sort],[data-set],[data-news]');
   if (!el) return;
   if (el.dataset.pill) {
     e.stopPropagation();
@@ -842,9 +946,15 @@ document.addEventListener('click', async (e) => {
     toast(PILL_LABEL[S.settings.pillMode], 1200);
     return;
   }
+  if (el.dataset.quick) { addSymbol(el.dataset.quick, '', 'watch', { stay: true }); return; }
   if (el.dataset.action) {
     const a = el.dataset.action;
     if (a === 'close') closeSheet();
+    else if (a === 'quick-add') { addSymbol(el.dataset.sym, '', el.dataset.list, { stay: true }); openDetail(el.dataset.sym); }
+    else if (a === 'load-sample') loadSample();
+    else if (a === 'welcome-done') { store.set('welcomeDone', true); render(); }
+    else if (a === 'share-app') shareOrCopy('マイ株ボード', '株価・為替・保有株の値動きを一目で見られるアプリです(無料・登録不要)', appURL());
+    else if (a === 'share-list') shareOrCopy('マイ株ボードの銘柄リスト', '私がチェックしている銘柄のリストです。開くとまとめて追加できます', listShareURL());
     else if (a === 'add') openAdd(el.dataset.list || (S.tab === 'hold' ? 'hold' : 'watch'));
     else if (a === 'remove') removeSymbol(el.dataset.sym);
     else if (a === 'move') moveSymbol(el.dataset.sym, el.dataset.to);
@@ -928,10 +1038,11 @@ window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); S.in
 
 // ===================== 起動 =====================
 applyTheme();
+setUniverse(store.get('universe', []));
 const initial = location.hash.slice(1);
 S.tab = TABS[initial] ? initial : (S.settings.startTab || 'home');
 render();
-refresh({ silent: true });
+refresh({ silent: true }).then(checkSharedList);
 scheduleAuto();
 setInterval(renderHeader, 30000);
 

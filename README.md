@@ -9,13 +9,25 @@
 - **ホーム画面に追加(PWA)**: アプリのように1タップで起動。前回データを即表示し、最新データへ自動更新。オフラインでも前回の画面を表示
 - 値動きの色は日本式(上昇=赤)/米国式(上昇=緑)、ライト/ダークを切り替え可能
 
+## ほかの人と使う
+
+アプリのURL(`https://<ユーザー名>.github.io/stock-board/`)を送るだけで、だれでも使えます(登録不要・無料)。
+
+- 銘柄の一覧・保有数・取得単価・目標買値は**各自の端末のブラウザ内**に保存されます。ほかの人の内容は見えません
+- 約270銘柄(日本株・米国株・ETF・投資信託・指数・為替)の株価を共通で自動取得しているので、だれでも検索してすぐに追加できます(一覧は `data/universe.json`)
+- 設定 →「自分の銘柄リストを送る」で、銘柄の名前だけを共有するリンクを作れます(保有数や金額は含まれません)
+- 一覧にない銘柄を取得対象に加えられるのは、GitHub 連携を設定した管理者だけです
+
 ## 仕組み
 
 ```
-GitHub Actions (平日15分ごと)                GitHub Pages
-  scripts/fetch_quotes.py  ──書き込み──▶  data/quotes.json  ◀──読み込み── スマホ / PC のアプリ
-  (Yahoo Finance・Google ニュース)          data/watchlist.json ◀──銘柄の追加/削除── アプリ(GitHub連携)
+GitHub Actions (平日15分ごと)                         GitHub Pages
+  scripts/fetch_quotes.py ──サイトを組み立てて公開──▶  data/quotes.json 等 ◀──読み込み── 各自のスマホ / PC
+  (Yahoo Finance・投資信託協会・Google ニュース)
+  取得対象 = data/universe.json + data/watchlist.json ◀──取得対象の追加── 管理者のアプリ(GitHub連携)
 ```
+
+株価データはリポジトリには保存せず、実行のたびにサイトとして公開します(リポジトリが大きくならないように)。
 
 - 株価は平日約15分ごと・土日3時間ごとに自動取得(Yahoo Finance、最大20分程度の遅延)。投資信託は1日1回の基準価額
 - PER などの財務情報と5年チャートは12時間ごと、ニュースは1時間ごとに更新
@@ -26,7 +38,7 @@ GitHub Actions (平日15分ごと)                GitHub Pages
 1. **GitHub アカウント**を作成し、新しい **Public** リポジトリ(例: `stock-board`)を作る
    (無料プランで GitHub Pages を使うには Public が必要です。銘柄の一覧は公開されますが、保有数や金額は公開されません)
 2. このフォルダの中身をリポジトリにアップロードする
-3. リポジトリの **Settings → Pages** で、Source を「Deploy from a branch」、Branch を `main` / `/(root)` にして Save
+3. リポジトリの **Settings → Pages** で、Source を **GitHub Actions** にする
 4. **Actions** タブを開き、「株価データ更新」を選んで **Run workflow** で初回実行(1〜3分)
 5. 数分後、`https://<ユーザー名>.github.io/stock-board/` を開くと表示されます
 
@@ -36,19 +48,19 @@ GitHub Actions (平日15分ごと)                GitHub Pages
 - **Android**: Chrome で開く → ︙ メニュー → 「ホーム画面に追加」/「アプリをインストール」
 - **PC**: Chrome/Edge のアドレスバー右端のインストールアイコン、またはブックマーク
 
-### 銘柄の追加・削除をアプリから行う(推奨)
+### 取得対象の銘柄を増やす(管理者向け)
 
-アプリの **設定 → GitHub 連携** にトークンを登録すると、アプリの「＋」ボタンで追加した銘柄が株価の取得対象に自動で反映されます(端末ごとに1回)。
+アプリの **設定 → 管理者向け(GitHub 連携)** にトークンを登録すると、検索に出ない銘柄をコードで追加したときに、株価の取得対象(`data/watchlist.json`)へ自動で加わります(端末ごとに1回)。
 
 1. <https://github.com/settings/personal-access-tokens/new> を開く
 2. Repository access: **Only select repositories** → このリポジトリ
 3. Repository permissions: **Contents: Read and write**(「今すぐ株価を取得」ボタンを使う場合は **Actions: Read and write** も)
 4. 作成したトークンをアプリの設定画面に貼り付けて「保存して接続テスト」
 
-トークンを使わない場合は、`data/watchlist.json` の `symbols` に次の形式で1行追加しても同じです。
+トークンを使わない場合は、`data/watchlist.json` の `symbols` に次の形式で1行追加しても同じです(投資信託は ISIN コードを `"isin"` に入れると基準価額を取得できます)。
 
 ```json
-{ "symbol": "7203.T", "name": "トヨタ自動車", "list": "watch", "type": "stock", "news": "トヨタ 株" }
+{ "symbol": "7203.T", "name": "トヨタ自動車", "type": "stock", "news": "トヨタ 株" }
 ```
 
 | 種類 | symbol の書き方 | 例 |
@@ -58,12 +70,12 @@ GitHub Actions (平日15分ごと)                GitHub Pages
 | 投資信託 | 協会コード(8桁) + `.T`、`"type": "fund"` | `0331418A.T` |
 | 指数・為替 | Yahoo Finance の記号 | `^N225`, `JPY=X` |
 
-`list` は `hold`(保有)か `watch`(ウォッチ)。マーケット欄の指標は `markets` で変更できます。
+`watchlist.json` の `symbols` は、初めて開いた人が「サンプルを読み込む」で追加できる銘柄も兼ねています。マーケット欄の指標は `markets` で変更できます。
 
 ## うまく動かないとき
 
 - **データが更新されない**: Actions タブで「株価データ更新」の実行結果を確認。60日間リポジトリに動きがないと GitHub が定期実行を止めることがあります(その場合は Actions タブで再度有効化)
-- **Actions が push できない**: Settings → Actions → General → Workflow permissions を「Read and write permissions」に
+- **公開(deploy)が失敗する**: Settings → Pages の Source が **GitHub Actions** になっているか確認
 - **銘柄が「取得できませんでした」**: コードの書き方を確認(上の表)
 
 ## ファイル構成
@@ -71,8 +83,8 @@ GitHub Actions (平日15分ごと)                GitHub Pages
 ```
 index.html / css/ / js/        アプリ本体(ビルド不要の HTML/CSS/JavaScript)
 manifest.webmanifest, sw.js    ホーム画面追加・オフライン対応
-data/watchlist.json            取得する銘柄の一覧
-data/quotes.json               取得した株価(自動生成)
+data/universe.json             共通で株価を取得する銘柄の一覧(検索候補)
+data/watchlist.json            マーケット指標・追加の取得対象・サンプル銘柄
 scripts/fetch_quotes.py        株価取得スクリプト
 .github/workflows/             定期実行の設定
 ```

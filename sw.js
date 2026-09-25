@@ -1,5 +1,5 @@
 // オフラインでも前回の画面が開けるようにするサービスワーカー
-const VERSION = 'v1';
+const VERSION = 'v2';
 const SHELL = [
   './', 'index.html', 'css/style.css', 'manifest.webmanifest',
   'js/app.js', 'js/util.js', 'js/chart.js', 'js/indicators.js', 'js/github.js', 'js/symbols.js',
