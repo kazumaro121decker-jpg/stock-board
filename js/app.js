@@ -508,6 +508,8 @@ function viewSettings() {
     ${ios ? '<p class="muted small" style="margin:10px 0 0">ヒント: iPhone の「ショートカット」アプリのオートメーションで、毎朝決まった時刻にこのアプリを開く設定もできます。</p>' : ''}
   </div></div>
 
+${widgetSection()}
+
   <div class="section"><div class="section-head"><h2>ほかの人にこのアプリを紹介</h2></div>
   <div class="card card-pad">
     <p style="margin:0 0 10px" class="small">このページのURLを送るだけで、だれでも使えます。登録なし・無料です。銘柄の一覧・保有数・目標買値は<b>各自の端末の中だけ</b>に保存されるので、あなたの保有内容が相手に見えることはありません。</p>
@@ -549,7 +551,71 @@ function viewSettings() {
   </div></div>`;
 }
 
-function bindSettings() { /* 入力はクリック委譲で処理 */ }
+// ===================== ホーム画面ウィジェット =====================
+// iPhone / iPad は無料アプリ「Scriptable」で、このアプリの株価データをウィジェット表示する
+function widgetCandidates() {
+  const markets = (S.served?.markets || []).map((m) => ({ symbol: m.symbol, name: m.name }));
+  const mine = (S.my?.items || []).map((i) => ({ symbol: i.symbol, name: i.name || nameOf(i.symbol) }));
+  const seen = new Set();
+  return [...mine, ...markets].filter((x) => (seen.has(x.symbol) ? false : seen.add(x.symbol)));
+}
+function widgetSymbols() {
+  if (Array.isArray(S.settings.widgetSyms) && S.settings.widgetSyms.length) return S.settings.widgetSyms;
+  const def = ['^N225', 'JPY=X', ...(S.my?.items || []).filter((i) => i.list === 'hold').map((i) => i.symbol), ...(S.my?.items || []).filter((i) => i.list === 'watch').map((i) => i.symbol)];
+  return [...new Set(def)].slice(0, 12);
+}
+function widgetSection() {
+  const sel = widgetSymbols();
+  const cands = widgetCandidates();
+  if (!S.widgetTpl) fetch('widget/scriptable-widget.js' + bust()).then((r) => (r.ok ? r.text() : null)).then((t) => { S.widgetTpl = t; }).catch(() => {});
+  const box = (x) => `<label class="chip ${sel.includes(x.symbol) ? 'info' : ''}" style="cursor:pointer"><input type="checkbox" data-wsym="${esc(x.symbol)}" ${sel.includes(x.symbol) ? 'checked' : ''} style="display:none">${sel.includes(x.symbol) ? '✓ ' : ''}${esc(x.name)}</label>`;
+  return `<div class="section"><div class="section-head"><h2>ホーム画面ウィジェット</h2></div>
+  <div class="card card-pad">
+    <p style="margin:0 0 10px" class="small">アプリを開かなくても、ホーム画面やロック画面で株価を一目で確認できます。<b>iPhone / iPad</b> は無料アプリ「Scriptable」を使います。</p>
+    <div class="small" style="font-weight:700;margin-bottom:6px">① ウィジェットに表示する銘柄(上から順に 小4・中5・大12銘柄) — ${sel.length}件選択中</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px">${cands.map(box).join('')}</div>
+    <div class="small" style="font-weight:700;margin-bottom:6px">② 設定手順</div>
+    <ol class="steps" style="margin-top:0">
+      <li>App Store で <a href="https://apps.apple.com/jp/app/scriptable/id1405459188" target="_blank" rel="noopener">Scriptable(無料)</a> をインストール</li>
+      <li>下の <b>「ウィジェット用スクリプトをコピー」</b> を押す</li>
+      <li>Scriptable を開き、右上の <span class="kbd">＋</span> → 画面に<b>貼り付け</b> → 左上の <span class="kbd">Done</span>(名前を「株ボード」などに変えると分かりやすいです)</li>
+      <li>ホーム画面の何もないところを長押し → 左上の <span class="kbd">＋</span>(または「編集」→「ウィジェットを追加」) → <b>Scriptable</b> → 大きさを選んで追加</li>
+      <li>追加したウィジェットを長押し → <b>ウィジェットを編集</b> → Script で <b>株ボード</b> を選ぶ</li>
+    </ol>
+    <div class="btn-row" style="margin-top:10px">
+      <button class="btn primary" data-action="widget-copy">ウィジェット用スクリプトをコピー</button>
+    </div>
+    <p class="muted small" style="margin:10px 0 0">約15分ごとに自動で更新されます(更新のタイミングは iPhone が調整します)。ウィジェットをタップするとこのアプリが開きます。ロック画面のウィジェットにも使えます。銘柄を変えたときは、もう一度コピーして Scriptable のスクリプトを貼り替えてください。</p>
+    <p class="muted small" style="margin:6px 0 0">Android: Web アプリはウィジェットに対応していないため、「ホーム画面に追加」したアイコンから開いてください。</p>
+  </div></div>`;
+}
+
+function widgetScript() {
+  if (!S.widgetTpl) return null;
+  return S.widgetTpl
+    .replace('__APP_URL__', appURL())
+    .replace('__SYMBOLS__', JSON.stringify(widgetSymbols()))
+    .replace('__COLORS__', S.settings.colors === 'us' ? 'us' : 'jp');
+}
+
+function copyWidgetScript() {
+  const code = widgetScript();
+  if (!code) { toast('準備中です。数秒後にもう一度押してください'); return; }
+  const fallback = () => openSheet(`<div class="d-head"><div><h2 class="d-title" id="sheet-title">ウィジェット用スクリプト</h2><div class="d-sym">全部選択してコピーしてください</div></div>${closeBtn()}</div>
+    <div class="field" style="margin-top:12px"><textarea id="wcode" rows="14" readonly style="font-family:ui-monospace,monospace;font-size:12px">${esc(code)}</textarea></div>`);
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(code).then(() => toast('コピーしました。Scriptable を開いて貼り付けてください', 4500), fallback);
+  } else fallback();
+}
+
+function bindSettings() {
+  $$('[data-wsym]').forEach((cb) => cb.addEventListener('change', () => {
+    const cur = widgetSymbols().filter((s) => s !== cb.dataset.wsym);
+    if (cb.checked) cur.push(cb.dataset.wsym);
+    S.settings.widgetSyms = cur;
+    saveSettings(); render();
+  }));
+}
 
 // ===================== 詳細シート =====================
 let unmountChart = null;
@@ -952,6 +1018,7 @@ document.addEventListener('click', async (e) => {
     if (a === 'close') closeSheet();
     else if (a === 'quick-add') { addSymbol(el.dataset.sym, '', el.dataset.list, { stay: true }); openDetail(el.dataset.sym); }
     else if (a === 'load-sample') loadSample();
+    else if (a === 'widget-copy') copyWidgetScript();
     else if (a === 'welcome-done') { store.set('welcomeDone', true); render(); }
     else if (a === 'share-app') shareOrCopy('マイ株ボード', '株価・為替・保有株の値動きを一目で見られるアプリです(無料・登録不要)', appURL());
     else if (a === 'share-list') shareOrCopy('マイ株ボードの銘柄リスト', '私がチェックしている銘柄のリストです。開くとまとめて追加できます', listShareURL());

@@ -37,7 +37,7 @@ jobs:
       - name: サイトを組み立て
         run: |
           mkdir -p _site
-          cp -r index.html manifest.webmanifest sw.js .nojekyll css js icons _site/
+          cp -r index.html manifest.webmanifest sw.js .nojekyll css js icons widget _site/
           mkdir -p _site/data
           cp data/watchlist.json data/universe.json _site/data/
 
